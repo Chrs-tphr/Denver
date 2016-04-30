@@ -1,0 +1,313 @@
+/******* Testing ******
+aa.env.setValue("appGroup","Licenses");
+aa.env.setValue("appTypeType","");
+aa.env.setValue("appSubtype","");
+aa.env.setValue("appCategory","*");
+aa.env.setValue("appStatus","Pending");
+aa.env.setValue("numDaysToEmail",355);
+aa.env.setValue("numDaysToExpire",395);
+aa.env.setValue("emailTemplate","EL_CLOSURE NOTICE");
+aa.env.setValue("reportToSend","E & L Closure Notice")
+*/
+/*------------------------------------------------------------------------------------------------------/
+| Program: Batch Expiration.js  Trigger: Batch
+| Client: Denver
+|
+| Frequency: Daily
+|
+| Desc: This batch script checks the number of days between today and file date of the record
+|			If the difference is 335 days - Then send email notification
+|			If the difference is 396 days - Then update the record status to "Closed - Administratively" and close all active WF tasks.
+|
+/------------------------------------------------------------------------------------------------------*/
+/*------------------------------------------------------------------------------------------------------/
+|
+| START: USER CONFIGURABLE PARAMETERS
+|
+/------------------------------------------------------------------------------------------------------*/
+emailText = "";
+maxSeconds = 3000 //4.5 * 60;		// number of seconds allowed for batch processing, usually < 5*60
+message = "";
+br = "<br>";
+debug = ""
+emailAddress = ""
+currentUserID = "ADMIN"
+var useTaskSpecificGroupName = true;
+/*------------------------------------------------------------------------------------------------------/
+| BEGIN Includes
+/------------------------------------------------------------------------------------------------------*/
+SCRIPT_VERSION = 2.0
+
+
+eval(getMasterScriptText("INCLUDES_ACCELA_FUNCTIONS"));
+eval(getMasterScriptText("INCLUDES_CUSTOM"));
+
+eval("function logDebug(dstr) { aa.print(dstr+'<br>'); } ") 
+
+function getScriptText(vScriptName){
+	vScriptName = vScriptName.toUpperCase();
+	var emseBiz = aa.proxyInvoker.newInstance("com.accela.aa.emse.emse.EMSEBusiness").getOutput();
+	var emseScript = emseBiz.getScriptByPK(aa.getServiceProviderCode(),vScriptName,"ADMIN");
+	return emseScript.getScriptText() + "";
+}
+
+function getMasterScriptText(vScriptName){
+	vScriptName = vScriptName.toUpperCase();
+	var emseBiz = aa.proxyInvoker.newInstance("com.accela.aa.emse.emse.EMSEBusiness").getOutput();
+	var emseScript = emseBiz.getMasterScript(aa.getServiceProviderCode(),vScriptName);
+	return emseScript.getScriptText() + "";
+}
+
+/*------------------------------------------------------------------------------------------------------/
+|
+| END: USER CONFIGURABLE PARAMETERS
+|
+/------------------------------------------------------------------------------------------------------*/
+showDebug = true//aa.env.getValue("showDebug").substring(0,1).toUpperCase().equals("Y");
+
+sysDate = aa.date.getCurrentDate();
+batchJobResult = aa.batchJob.getJobID()
+batchJobName = "Test" //+ aa.env.getValue("BatchJobName");
+wfObjArray = null;
+
+batchJobID = 0;
+if (batchJobResult.getSuccess()) {
+  batchJobID = batchJobResult.getOutput();
+  logDebug("Batch Job " + batchJobName + " Job ID is " + batchJobID);
+}
+else
+  logDebug("Batch job ID not found " + batchJobResult.getErrorMessage());
+
+
+/*----------------------------------------------------------------------------------------------------/
+|
+| Start: BATCH PARAMETERS
+|
+/------------------------------------------------------------------------------------------------------*/
+
+var appGroup = getParam("appGroup");							//   app Group to process {Licenses}
+var appTypeType = getParam("appTypeType");						//   app type to process {Rental License}
+var appSubtype = getParam("appSubtype");						//   app subtype to process {NA}
+var appCategory = getParam("appCategory");						//   app category to process {NA}
+var appStatus = getParam("appStatus");
+var numDaysToEmail = getParam("numDaysToEmail");
+var numDaysToExpire = getParam("numDaysToExpire");
+var emailAddress = getParam("emailAddress");					// email to send report
+var fromEmailAddress = getParam("fromEmailAddress");
+var emailTemplate = getParam("emailTemplate");					// email Template
+var reportToSend = getParam("reportToSend");
+
+/*----------------------------------------------------------------------------------------------------/
+|
+| End: BATCH PARAMETERS
+|
+/------------------------------------------------------------------------------------------------------*/
+var startDate = new Date();
+var timeExpired = false;
+
+var startTime = startDate.getTime();			// Start timer
+var systemUserObj = aa.person.getUser("ADMIN").getOutput();
+
+
+if (matches(appGroup,"","*"))		appGroup="%";
+if (matches(appTypeType,"","*"))	appTypeType="%";
+if (matches(appSubtype,"","*"))		appSubtype="%";
+if (matches(appCategory,"","*"))	appCategory="%";
+//var appType = appGroup+"/"+appTypeType+"/"+appSubtype+"/"+appCategory;
+
+/*------------------------------------------------------------------------------------------------------/
+| <===========Main=Loop================>
+|
+/-----------------------------------------------------------------------------------------------------*/
+
+logDebug("Start of Job");
+
+if (!timeExpired) mainProcess();
+
+logDebug("End of Job: Elapsed Time : " + elapsed() + " Seconds");
+
+if (emailAddress.length)
+	aa.sendMail("noreply@accela.com", emailAddress, "", batchJobName + " Results", emailText);
+
+
+/*------------------------------------------------------------------------------------------------------/
+| <===========END=Main=Loop================>
+/-----------------------------------------------------------------------------------------------------*/
+
+
+function mainProcess() {
+	if ( matches( ""+numDaysToEmail, "0", "","null")) {
+		logDebug("Invalid value for the number of days for Sending Email")
+		return;
+	}
+	if ( matches( ""+numDaysToExpire, "0", "","null")) {
+		logDebug("Invalid value for the number of days for Expiring Licenses")
+		return;
+	}
+	var numLicensesExpired = 0
+	var numEmailsSent = 0
+	var numEmailsFailedToSend = 0
+	var numWaiversFound = 0
+	var currentDate = new Date();
+    var one_day = 1000 * 60 * 60 * 24;
+	var appList = []
+	
+
+	argListType = []; argListStat =[];
+	//typeList = appTypeType.split(",")
+	statusList = appStatus.split(",")
+	if (statusList.length <= 0 ) {
+		logDebug("Error: need to provide record statuses for records to process")
+		return
+	}	
+	for ( s in statusList) argListStat.push("?")
+	//for ( t in typeList) argListType.push("?")
+		
+	var initialContext = aa.proxyInvoker.newInstance("javax.naming.InitialContext", null).getOutput();
+	var ds = initialContext.lookup("java:/AA");
+	var conn = ds.getConnection()
+	main: try{
+		var SQL = "SELECT B1_ALT_ID FROM B1PERMIT WHERE SERV_PROV_CODE = ? AND B1_PER_GROUP LIKE ? AND B1_PER_TYPE LIKE ? AND B1_PER_SUB_TYPE LIKE ? AND B1_PER_CATEGORY LIKE ? AND B1_APPL_STATUS IN ("+ argListStat.join(",") +")"
+		var dbStmt = conn.prepareStatement(SQL);
+		try {
+			index = 1
+			dbStmt.setString(index++,aa.getServiceProviderCode())
+			dbStmt.setString(index++,appGroup)
+			dbStmt.setString(index++,appTypeType)
+			dbStmt.setString(index++,appSubtype)
+			dbStmt.setString(index++,appCategory)
+			for (s in statusList) dbStmt.setString(index++,statusList[s].trim())
+			dbStmt.executeQuery();
+		}
+		catch(errr) {
+			aa.print("inner:" + errr.message);	break main
+		}
+		results = dbStmt.getResultSet()
+		while (results.next()) {
+			appList.push( results.getString("b1_alt_id")) 
+		}
+		dbStmt.close();
+	}
+	catch(err) {
+		aa.print(err.message); 
+		if (typeof dbStmt != "undefined") dbStmt.close();
+	}
+	conn.close() 
+
+	logDebug("Processing " + appList.length + " record" + ((appList > 1) ? "s" : ""))
+	for (i in appList)  {
+		if (elapsed() > maxSeconds) {
+			// only continue if time hasn't expired
+			logDebug("A script time-out has caused partial completion of this process.  Please re-run.  " + elapsed() + " seconds elapsed, " + maxSeconds + " allowed.") ;
+			timeExpired = true ;
+			break;
+		}
+		altId = ""+appList[i]
+		var capIdObj = aa.cap.getCapID(altId);
+		if (capIdObj.getSuccess()) { 
+			capId = capIdObj.getOutput();
+			cap = aa.cap.getCap(capId).getOutput();
+		} 
+		else {
+			aa.print("Record '" + altId.toUpperCase() + "' not found");
+			continue
+		}
+		
+		if (cap == null) {
+			if (altId.indexOf("TMP") < 0 && altId.indexOf("EST") < 0 ) logDebug("Could not retrieve the file date for " + altId)
+			continue
+		}
+		fileDateObj = cap.getFileDate();
+		fileDate = "" + fileDateObj.getMonth() + "/" + fileDateObj.getDayOfMonth() + "/" + fileDateObj.getYear();
+		var diffDays = Math.floor((Date.parse(currentDate) - Date.parse(fileDate)) / (one_day));
+		
+		if (diffDays >= numDaysToExpire) {
+			var waiverFound = false
+			var tsiList = []; 
+			var waivExp = null
+			var today = new Date()
+			loadTaskSpecific(tsiList);
+			var workflowResult = aa.workflow.getTasks(capId);
+			if (workflowResult.getSuccess()) {
+				wfObj = workflowResult.getOutput();
+				for (i in wfObj) {
+					fTask = wfObj[i];
+					var thisWaivExp = ""+tsiList[fTask.getProcessCode()+"."+fTask.getTaskDescription()+".Waiver Expiration Date"];
+					try{
+						if (!matches(thisWaivExp,"undefined", "null")){
+							thisJSwaivExp = new Date(thisWaivExp)
+							if (waivExp == null || thisJSwaivExp > today) {
+								logDebug("Found future Waiver Expiration Date for record "+ altId + ": Task '"+fTask.getTaskDescription()+"' - Waiver Exp Date " + thisWaivExp)
+								numWaiversFound++
+								waiverFound = true
+								break
+							}
+						}
+					}catch(err){
+						logDebug(err)
+					}
+					//logDebug( altId+" - "+fTask.getTaskDescription()+": "+thisWaivExp)
+				}
+			}
+			else
+				{ logMessage("**ERROR: Failed to get workflow object: " + s_capResult.getErrorMessage()); return false; }
+			
+			if (!waiverFound) {
+				logDebug("Expiring record: " + altId + " created on " + fileDate + "("+ diffDays+" days ago)")
+				deactivateELTasks(capId, "Closed - Administratively")
+				numLicensesExpired++
+			}
+			
+		}
+		if (diffDays == numDaysToEmail) {
+			logDebug("Attempting to send email notice for record: " + altId + " created on " + fileDate)
+			mailToAddr = getContactEmails_EL() 
+			if (mailToAddr.length <= 0) {
+				logDebug("Could not retrieve emails for the License "+ altId)
+				numEmailsFailedToSend++
+				continue
+			}
+			
+			// GENREATE REPORT
+			var rParams = aa.util.newHashtable();
+			rParams.put("altId", altId);
+			rFile = generateReport(capId,reportToSend,appGroup,rParams);
+			if (rFile) {
+				var rFiles = new Array();
+				rFiles.push(rFile);
+				var eParams = aa.util.newHashtable();
+				eParams.put("$$altId$$", altId);
+				// SEND EMAIL WITH ATTACHEMENT 
+				wasSent = sendNotification(fromEmailAddress,mailToAddr.join(";"),"",emailTemplate,eParams,rFiles,capId);
+				if (!wasSent ) {
+					logDebug("Could not send email to " + mailToAddr.join(";"))
+					numEmailsFailedToSend++
+					continue
+				}
+				numEmailsSent++
+			}
+			else {
+				logDebug("Could not generate the report " + reportName + " for record " + altId)
+				numEmailsFailedToSend++
+				continue
+			}
+		}	
+	}
+	logDebug("Number of Licenses that were expired: "+numLicensesExpired)
+	logDebug("Number of email notices that were sent: "+numEmailsSent)
+	logDebug("Number of email notices that failed to send: "+numEmailsFailedToSend)
+	logDebug("Number of Licenses not expired due to a future Waiver Expiration Date: "+numWaiversFound)
+}
+
+function elapsed() {
+    var thisDate = new Date();
+    var thisTime = thisDate.getTime();
+    return ((thisTime - startTime) / 1000)
+}
+
+function getParam(pParamName) {
+    var ret = "" + aa.env.getValue(pParamName);
+    logMessage("PARAMETER", pParamName + " = " + ret);
+    return ret;
+}
+

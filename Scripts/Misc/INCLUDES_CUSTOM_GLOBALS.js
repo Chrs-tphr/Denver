@@ -1,0 +1,1 @@
+if(currentUserID == "ADMIN") showDebug = 3; //user names need to be added in ALL CAPS!
